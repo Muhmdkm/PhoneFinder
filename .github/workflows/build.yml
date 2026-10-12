@@ -3,7 +3,7 @@ name: Build PhoneFinder APK
 on:
   workflow_dispatch:
   push:
-    branches: [ main ]
+    branches: [ main, master ]
 
 jobs:
   build:
@@ -19,15 +19,19 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+      - name: Setup Gradle Environment
+        uses: gradle/actions/setup-gradle@v3
 
-      - name: Build Debug APK
+      - name: Auto-generate Wrapper & Build APK
         run: |
+          if [ ! -f "./gradlew" ]; then
+            echo "Gradle wrapper missing, generating..."
+            gradle wrapper --gradle-version 8.4
+          fi
           chmod +x gradlew
           ./gradlew assembleDebug --stacktrace
 
-      - name: Upload APK
+      - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
           name: PhoneFinder-debug-apk
