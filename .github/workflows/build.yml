@@ -19,21 +19,297 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Setup Gradle Environment
-        uses: gradle/actions/setup-gradle@v3
-
-      - name: Auto-generate Wrapper & Build APK
+      - name: Generate Project Files & Build APK
         run: |
-          if [ ! -f "./gradlew" ]; then
-            echo "Gradle wrapper missing, generating..."
-            gradle wrapper --gradle-version 8.4
-          fi
-          chmod +x gradlew
-          ./gradlew assembleDebug --stacktrace
+          mkdir -p app/src/main/java/com/mansour/phonefinder/ui/theme
+          mkdir -p app/src/main/java/com/mansour/phonefinder/ble
+          mkdir -p app/src/main/java/com/mansour/phonefinder/service
+          mkdir -p app/src/main/java/com/mansour/phonefinder/data
+          mkdir -p app/src/main/java/com/mansour/phonefinder/receiver
+          mkdir -p app/src/main/res/values
+          mkdir -p app/src/main/res/drawable
 
-      - name: Upload APK Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: PhoneFinder-debug-apk
-          path: app/build/outputs/apk/debug/app-debug.apk
-          retention-days: 7
+          cat << 'EOF' > settings.gradle.kts
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS); repositories { google(); mavenCentral() } }
+          rootProject.name = "PhoneFinder"
+          include(":app")
+          EOF
+
+          cat << 'EOF' > build.gradle.kts
+          plugins {
+              id("com.android.application") version "8.2.0" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.10" apply false
+          }
+          EOF
+
+          cat << 'EOF' > app/build.gradle.kts
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.mansour.phonefinder"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.mansour.phonefinder"
+                  minSdk = 31
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+              buildFeatures { compose = true }
+              composeOptions { kotlinCompilerExtensionVersion = "1.5.3" }
+          }
+          dependencies {
+              implementation("androidx.core:core-ktx:1.12.0")
+              implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.6.2")
+              implementation("androidx.lifecycle:lifecycle-service:2.6.2")
+              implementation("androidx.activity:activity-compose:1.8.0")
+              val composeBom = platform("androidx.compose:compose-bom:2023.10.01")
+              implementation(composeBom)
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.ui:ui-graphics")
+              implementation("androidx.compose.ui:ui-tooling-preview")
+              implementation("androidx.compose.material3:material3:1.1.1")
+              implementation("androidx.compose.material:material-icons-extended:1.5.4")
+              implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/AndroidManifest.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
+              <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+              <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+              <uses-permission android:name="android.permission.WAKE_LOCK" />
+              <uses-permission android:name="android.permission.VIBRATE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <application
+                  android:allowBackup="true"
+                  android:icon="@android:drawable/ic_dialog_alert"
+                  android:label="Phone Finder"
+                  android:supportsRtl="true"
+                  android:theme="@style/Theme.PhoneFinder">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service android:name=".service.BLEConnectionService" android:enabled="true" android:exported="false" android:foregroundServiceType="connectedDevice" />
+                  <receiver android:name=".receiver.BootReceiver" android:enabled="true" android:exported="true">
+                      <intent-filter><action android:name="android.intent.action.BOOT_COMPLETED" /></intent-filter>
+                  </receiver>
+              </application>
+          </manifest>
+          EOF
+
+          cat << 'EOF' > app/src/main/res/values/strings.xml
+          <resources><string name="app_name">Phone Finder</string></resources>
+          EOF
+
+          cat << 'EOF' > app/src/main/res/values/themes.xml
+          <resources><style name="Theme.PhoneFinder" parent="android:Theme.Material.Light.NoActionBar" /></resources>
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/mansour/phonefinder/data/SettingsRepository.kt
+          package com.mansour.phonefinder.data
+          import android.content.Context
+          class SettingsRepository(context: Context) {
+              private val prefs = context.getSharedPreferences("phone_finder_prefs", Context.MODE_PRIVATE)
+              fun getAlertDuration(): Int = prefs.getInt("alert_duration", 15)
+              fun setAlertDuration(d: Int) = prefs.edit().putInt("alert_duration", d).apply()
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/mansour/phonefinder/service/AlertManager.kt
+          package com.mansour.phonefinder.service
+          import android.content.Context
+          import android.media.*
+          import android.os.*
+          import kotlinx.coroutines.*
+          import kotlinx.coroutines.flow.MutableStateFlow
+          import kotlin.math.*
+
+          class AlertManager(private val context: Context) {
+              private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+              private val scope = CoroutineScope(Dispatchers.Default + Job())
+              val isPlaying = MutableStateFlow(false)
+              private var alertJob: Job? = null
+
+              fun playAlert() {
+                  if (isPlaying.value) return
+                  isPlaying.value = true
+                  alertJob = scope.launch {
+                      val sampleRate = 44100
+                      val numSamples = sampleRate / 2
+                      val buffer = ShortArray(numSamples)
+                      for (i in 0 until numSamples) {
+                          val angle = 2.0 * PI * i / (sampleRate / 950.0)
+                          buffer[i] = (sin(angle) * Short.MAX_VALUE).toInt().toShort()
+                      }
+                      val audioTrack = AudioTrack.Builder()
+                          .setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_ALARM).setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION).build())
+                          .setAudioFormat(AudioFormat.Builder().setEncoding(AudioFormat.ENCODING_PCM_16BIT).setSampleRate(sampleRate).setChannelMask(AudioFormat.CHANNEL_OUT_MONO).build())
+                          .setBufferSizeInBytes(buffer.size * 2).setTransferMode(AudioTrack.MODE_STREAM).build()
+
+                      val maxVol = audioManager.getStreamMaxVolume(AudioManager.STREAM_ALARM)
+                      audioManager.setStreamVolume(AudioManager.STREAM_ALARM, maxVol, 0)
+                      audioTrack.play()
+
+                      val start = System.currentTimeMillis()
+                      while (isActive && isPlaying.value && (System.currentTimeMillis() - start) < 15000L) {
+                          audioTrack.write(buffer, 0, buffer.size)
+                      }
+                      audioTrack.stop()
+                      audioTrack.release()
+                      isPlaying.value = false
+                  }
+              }
+              fun stopAlert() { isPlaying.value = false; alertJob?.cancel() }
+              fun cleanup() { stopAlert(); scope.cancel() }
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/mansour/phonefinder/ble/BLEManager.kt
+          package com.mansour.phonefinder.ble
+          import android.annotation.SuppressLint
+          import android.bluetooth.*
+          import android.bluetooth.le.*
+          import android.content.Context
+          import android.os.*
+          import kotlinx.coroutines.flow.*
+          import java.util.*
+
+          enum class ConnectionState { CONNECTED, CONNECTING, DISCONNECTED }
+          data class BLEDevice(val name: String, val address: String, val rssi: Int)
+
+          @SuppressLint("MissingPermission")
+          class BLEManager(private val context: Context) {
+              companion object {
+                  const val TARGET_NAME = "PhoneFinder-ESP32"
+                  val SERVICE_UUID: UUID = UUID.fromString("7a1e0001-1234-4567-8901-123456789abc")
+                  val CHAR_UUID: UUID = UUID.fromString("7a1e0002-1234-4567-8901-123456789abc")
+                  val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+              }
+              private val bluetoothManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
+              private val adapter = bluetoothManager?.adapter
+              val connectionState = MutableStateFlow(ConnectionState.DISCONNECTED)
+              val discoveredDevices = MutableStateFlow<List<BLEDevice>>(emptyList())
+              val commandFlow = MutableSharedFlow<String>(extraBufferCapacity = 64)
+              private var gatt: BluetoothGatt? = null
+
+              private val scanCallback = object : ScanCallback() {
+                  override fun onScanResult(callbackType: Int, result: ScanResult) {
+                      val dev = result.device
+                      val name = dev.name ?: "Unknown"
+                      val list = discoveredDevices.value.toMutableList()
+                      if (list.none { it.address == dev.address }) {
+                          list.add(BLEDevice(name, dev.address, result.rssi))
+                          discoveredDevices.value = list
+                      }
+                  }
+              }
+
+              private val gattCallback = object : BluetoothGattCallback() {
+                  override fun onConnectionStateChange(g: BluetoothGatt, status: Int, newState: Int) {
+                      if (newState == BluetoothProfile.STATE_CONNECTED) {
+                          connectionState.value = ConnectionState.CONNECTING
+                          g.discoverServices()
+                      } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                          connectionState.value = ConnectionState.DISCONNECTED
+                      }
+                  }
+                  override fun onServicesDiscovered(g: BluetoothGatt, status: Int) {
+                      val char = g.getService(SERVICE_UUID)?.getCharacteristic(CHAR_UUID)
+                      if (char != null) {
+                          g.setCharacteristicNotification(char, true)
+                          val desc = char.getDescriptor(CCCD_UUID)
+                          desc?.let { it.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE; g.writeDescriptor(it) }
+                      }
+                  }
+                  override fun onDescriptorWrite(g: BluetoothGatt, d: BluetoothGattDescriptor, s: Int) {
+                      connectionState.value = ConnectionState.CONNECTED
+                  }
+                  override fun onCharacteristicChanged(g: BluetoothGatt, c: BluetoothGattCharacteristic, value: ByteArray) {
+                      if (value.decodeToString().trim() == "FIND_PHONE") commandFlow.tryEmit("FIND_PHONE")
+                  }
+              }
+
+              fun startScan() { adapter?.bluetoothLeScanner?.startScan(scanCallback) }
+              fun connect(address: String) { adapter?.bluetoothLeScanner?.stopScan(scanCallback); gatt = adapter?.getRemoteDevice(address)?.connectGatt(context, false, gattCallback) }
+              fun disconnect() { gatt?.disconnect(); gatt?.close(); connectionState.value = ConnectionState.DISCONNECTED }
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/mansour/phonefinder/service/BLEConnectionService.kt
+          package com.mansour.phonefinder.service
+          import android.app.*
+          import android.content.Context
+          import android.content.Intent
+          import android.os.Build
+          import android.os.IBinder
+          import androidx.core.app.NotificationCompat
+          import com.mansour.phonefinder.MainActivity
+          import com.mansour.phonefinder.ble.BLEManager
+          import kotlinx.coroutines.*
+          import kotlinx.coroutines.flow.collectLatest
+
+          class BLEConnectionService : Service() {
+              companion object { var instance: BLEConnectionService? = null }
+              lateinit var bleManager: BLEManager
+              lateinit var alertManager: AlertManager
+              private val scope = CoroutineScope(Dispatchers.Main + Job())
+
+              override fun onCreate() {
+                  super.onCreate()
+                  instance = this
+                  bleManager = BLEManager(this)
+                  alertManager = AlertManager(this)
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      val chan = NotificationChannel("pf_channel", "Phone Finder", NotificationManager.IMPORTANCE_LOW)
+                      (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(chan)
+                  }
+                  val notif = NotificationCompat.Builder(this, "pf_channel")
+                      .setContentTitle("Phone Finder Active").setContentText("Listening for ESP32...")
+                      .setSmallIcon(android.R.drawable.ic_dialog_alert).build()
+                  startForeground(1, notif)
+
+                  scope.launch {
+                      bleManager.commandFlow.collectLatest { if (it == "FIND_PHONE") alertManager.playAlert() }
+                  }
+              }
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
+              override fun onBind(intent: Intent?): IBinder? = null
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/mansour/phonefinder/receiver/BootReceiver.kt
+          package com.mansour.phonefinder.receiver
+          import android.content.*
+          import android.os.Build
+          import com.mansour.phonefinder.service.BLEConnectionService
+
+          class BootReceiver : BroadcastReceiver() {
+              override fun onReceive(context: Context, intent: Intent) {
+                  if (intent.action == Intent.ACTION_BOOT_COMPLETED) {
+                      val i = Intent(context, BLEConnectionService::class.java)
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) context.startForegroundService(i) else context.startService(i)
+                  }
+              }
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/mansour/phonefinder/MainActivity.kt
+          package com.mansour.phonefinder
+          import android.Manifest
+          
